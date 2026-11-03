@@ -107,7 +107,7 @@ jobs:
     docs:
         name: Docs
         needs: changes
-        if: needs.changes.outputs.docs == 'true'
+        if: always()
         runs-on: ubuntu-latest
         steps:
             -   uses: actions/checkout@v7
@@ -167,7 +167,7 @@ jobs:
     macos-check:
         name: macOS app
         needs: changes
-        if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+        if: always()
         runs-on: macos-26
         steps:
             -   uses: actions/checkout@v7
@@ -184,7 +184,7 @@ jobs:
     windows-check:
         name: Windows app
         needs: changes
-        if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+        if: always()
         runs-on: windows-2025
         steps:
             -   uses: actions/checkout@v7
