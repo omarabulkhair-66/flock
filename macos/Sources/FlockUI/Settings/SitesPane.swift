@@ -7,7 +7,8 @@ import UniformTypeIdentifiers
 /// domains and document root, its PHP and Node.js versions and what serves it. Each version picker
 /// offers the project's pinned version (or the default) first, then the installed versions, which
 /// isolate the site on this machine; the document root picker works the same way. The pin menu
-/// pins a version or the document root into the project or removes it again.
+/// pins a version or the document root into the project or removes it again. Proxies (`flock proxy`)
+/// follow the sites in a section of their own.
 struct SitesPane: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
@@ -41,15 +42,37 @@ struct SitesPane: View {
         nonmutating set { sharingState.wrappedValue = newValue }
     }
 
+    /// The Add Proxy alert is open; its name and upstream typed so far.
+    private let addingProxyState = State<Bool>(initialValue: false)
+    private let newProxyNameState = State<String>(initialValue: "")
+    private let newProxyUpstreamState = State<String>(initialValue: "")
+    /// The proxy whose upstream is being changed, and the upstream typed so far.
+    private let editingUpstreamState = State<String?>(initialValue: nil)
+    private var editingUpstream: String? {
+        get { editingUpstreamState.wrappedValue }
+        nonmutating set { editingUpstreamState.wrappedValue = newValue }
+    }
+    private let upstreamDraftState = State<String>(initialValue: "")
+    /// Commands typed for Node.js sites and not saved yet, by site name.
+    private let commandDraftsState = State<[String: String]>(initialValue: [:])
+    private var commandDrafts: [String: String] {
+        get { commandDraftsState.wrappedValue }
+        nonmutating set { commandDraftsState.wrappedValue = newValue }
+    }
+
     var body: some View {
         let store = model.settings
         let sites = model.status?.sites ?? []
+        let proxies = model.status?.proxies ?? []
         let phpVersions = store.config?.php.map(\.version) ?? []
         let nodeMajors = store.config?.nodeMajors ?? []
 
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .bottom) {
                 PaneHeader(title: "Sites", subtitle: "Sites you added one by one, plus every folder inside your project folders.")
+                Button("Add Proxy…") { addingProxyState.wrappedValue = true }
+                    .help("Serve a server of its own, e.g. a Node.js dev server on a port, at a .\(model.status?.dns.tld ?? "test") domain")
+                    .padding(.bottom, 6)
                 Button("Add Site…") {
                     for url in SettingsStore.chooseDirectories(prompt: "Add", multiple: false) {
                         Task { await store.perform { _ = try await $0.linkSite(path: url.path) } }
@@ -59,17 +82,20 @@ struct SitesPane: View {
                 .padding(.bottom, 6)
             }
 
-            if sites.isEmpty {
+            if sites.isEmpty && proxies.isEmpty {
                 ContentUnavailableView("No sites", systemImage: "globe",
                                        description: Text("Add a single site here, or add a project folder in General."))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 // The sites in a list, the selected one's details beside it, as in Services.
-                let selected = sites.first { $0.id == selectionState.wrappedValue } ?? sites[0]
+                // Site and proxy names never clash (the daemon refuses it), so one selection covers both.
+                let selectedProxy = proxies.first { $0.id == selectionState.wrappedValue } ?? (sites.isEmpty ? proxies.first : nil)
+                let selected = selectedProxy == nil ? sites.first { $0.id == selectionState.wrappedValue } ?? sites.first : nil
+                let selectedID = selectedProxy?.id ?? selected?.id
                 HStack(spacing: 0) {
                     // The details are rebuilt for each site, which takes the focus off the list; it is
                     // given back so the arrow keys keep moving through the sites.
-                    List(selection: Binding<Status.Site.ID?>(get: { selected.id }, set: {
+                    List(selection: Binding<Status.Site.ID?>(get: { selectedID }, set: {
                         selectionState.wrappedValue = $0
                         listFocusState.wrappedValue = true
                     })) {
@@ -78,6 +104,13 @@ struct SitesPane: View {
                             // Its git worktrees, under it.
                             ForEach(sites.worktrees(of: site.name)) { worktree in
                                 worktreeRow(worktree).tag(worktree.id)
+                            }
+                        }
+                        if !proxies.isEmpty {
+                            Section("Proxies") {
+                                ForEach(proxies) { proxy in
+                                    proxyRow(proxy).tag(proxy.id)
+                                }
                             }
                         }
                     }
@@ -89,22 +122,24 @@ struct SitesPane: View {
 
                     ScrollView {
                         Group {
-                            if selected.isWorktree {
+                            if let selectedProxy {
+                                proxyDetail(selectedProxy)
+                            } else if let selected, selected.isWorktree {
                                 WorktreeDetail(worktree: selected) { selectionState.wrappedValue = selected.parent }
-                            } else {
+                            } else if let selected {
                                 detail(selected, phpVersions: phpVersions, nodeMajors: nodeMajors)
                             }
                         }
                         .padding(16)
                     }
                     // Another site's details start at the top.
-                    .id(selected.id)
+                    .id(selectedID)
                     .frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
                 }
                 .onChange(of: model.pendingSite, initial: true) { _, name in
                     // A notification or link asks for this site: selected once.
-                    if let name, sites.contains(where: { $0.name == name }) {
+                    if let name, sites.contains(where: { $0.name == name }) || proxies.contains(where: { $0.name == name }) {
                         selectionState.wrappedValue = name
                         model.pendingSite = nil
                     }
@@ -148,6 +183,39 @@ struct SitesPane: View {
             Button("Cancel", role: .cancel) { newDomainState.wrappedValue = "" }
         } message: {
             Text(domainHelp)
+        }
+        .alert("Add a proxy", isPresented: addingProxyState.projectedValue) {
+            TextField("Name, e.g. my-app", text: newProxyNameState.projectedValue)
+            TextField("Port, host:port or URL, e.g. 3000", text: newProxyUpstreamState.projectedValue)
+            Button("Add") {
+                let name = newProxyNameState.wrappedValue.trimmingCharacters(in: .whitespaces)
+                let upstream = newProxyUpstreamState.wrappedValue.trimmingCharacters(in: .whitespaces)
+                newProxyNameState.wrappedValue = ""
+                newProxyUpstreamState.wrappedValue = ""
+                if !name.isEmpty, !upstream.isEmpty {
+                    selectionState.wrappedValue = name
+                    Task { await store.perform { _ = try await $0.proxy(name: name, upstream: upstream) } }
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                newProxyNameState.wrappedValue = ""
+                newProxyUpstreamState.wrappedValue = ""
+            }
+        } message: {
+            Text("Flock serves <name>.\(model.status?.dns.tld ?? "test") from a server of its own, e.g. a Next.js, Nuxt or Vite dev server. A port means 127.0.0.1.")
+        }
+        .alert("Change the upstream of \(editingUpstream ?? "")", isPresented: Binding(get: { editingUpstream != nil }, set: { if !$0 { editingUpstream = nil } })) {
+            TextField("Port, host:port or URL", text: upstreamDraftState.projectedValue)
+            Button("Change") {
+                let name = editingUpstream ?? ""
+                let upstream = upstreamDraftState.wrappedValue.trimmingCharacters(in: .whitespaces)
+                if !name.isEmpty, !upstream.isEmpty {
+                    Task { await store.perform { _ = try await $0.proxy(name: name, upstream: upstream) } }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("A port means 127.0.0.1; give a host and port (localhost:5173) or a URL (https://127.0.0.1:8443) for anything else.")
         }
         // A flock://secure link (AppModel.handle): nothing changes until the user confirms here.
         .alert(linkRequest?.title ?? "", isPresented: Binding(get: { linkRequest != nil }, set: { if !$0 { model.pendingSecure = nil } }),
@@ -207,6 +275,251 @@ struct SitesPane: View {
         .help(site.path)
     }
 
+    /// A proxy in the list: its name and where it passes requests, a lock when it is secured, a
+    /// warning when it isn't served.
+    private func proxyRow(_ proxy: Status.Proxy) -> some View {
+        HStack(spacing: 6) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(proxy.name).fontWeight(.medium).lineLimit(1)
+                Text("\(proxy.domain) → \(upstreamLabel(proxy.upstream))").font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            Spacer(minLength: 4)
+            if let problem = proxy.problem {
+                Image(systemName: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange)
+                    .help(problem)
+            }
+            Circle()
+                .fill(proxy.running ? Color.green : Color.secondary.opacity(0.5))
+                .frame(width: 6, height: 6)
+                .help(proxy.running ? proxy.server ?? "Running" : "Not running")
+            if proxy.secured {
+                Image(systemName: "lock.fill").font(.caption).foregroundStyle(.secondary)
+                    .help("Served over HTTPS")
+            }
+        }
+        .padding(.vertical, 2)
+        .help(proxy.upstream)
+    }
+
+    /// An upstream without the http:// Flock adds: 127.0.0.1:3000.
+    private func upstreamLabel(_ upstream: String) -> String {
+        upstream.hasPrefix("http://") ? String(upstream.dropFirst("http://".count)) : upstream
+    }
+
+    /// The selected proxy: its address and actions, then its HTTPS and upstream.
+    private func proxyDetail(_ proxy: Status.Proxy) -> some View {
+        let store = model.settings
+        return VStack(alignment: .leading, spacing: 20) {
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(proxy.name).font(.title3.weight(.semibold))
+                        Badge(text: "Proxy", color: .secondary)
+                    }
+                    if let text = proxy.url, let url = URL(string: text) {
+                        Link(text, destination: url).font(.callout)
+                    }
+                }
+                Spacer(minLength: 8)
+                HStack(spacing: 8) {
+                    Button {
+                        if let text = proxy.url, let url = URL(string: text) { NSWorkspace.shared.open(url) }
+                    } label: { Image(systemName: "safari") }
+                        .help("Open \(proxy.url ?? proxy.domain)")
+                        .disabled(proxy.url == nil)
+                    Button {
+                        confirm = ConfirmAction(
+                            title: "Remove \(proxy.name)?", button: "Remove", destructive: true,
+                            message: "Flock stops serving \(proxy.domain). The server at \(proxy.upstream) keeps running.",
+                            run: { [name = proxy.name] client in try await client.removeProxy(name) })
+                    } label: { Image(systemName: "minus.circle") }
+                        .help("Remove proxy")
+                }
+                .buttonStyle(.borderless)
+            }
+            if let problem = proxy.problem {
+                Label(problem, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout).foregroundStyle(.orange)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            section("Proxy") {
+                field("Server") {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(proxyStateColor(proxy))
+                                .frame(width: 7, height: 7)
+                            Text(proxyStateText(proxy))
+                            if let command = proxy.command {
+                                proxyStartStop(proxy, command)
+                            }
+                        }
+                        if let command = proxy.command, command.state == .failed, !command.problem.isEmpty {
+                            Text(command.problem).font(.caption).foregroundStyle(.orange)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else if !proxy.running {
+                            Text(proxy.command?.state == .starting
+                                 ? "Waiting for \(upstreamLabel(proxy.upstream)) to answer…"
+                                 : "Nothing answers at \(upstreamLabel(proxy.upstream)) yet.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                field("HTTPS") {
+                    Toggle("HTTPS", isOn: Binding(
+                        get: { proxy.secured },
+                        set: { on in Task { await store.perform { _ = try await $0.secureProxy(proxy.name, on) } } }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                }
+                field("Upstream") {
+                    HStack(spacing: 8) {
+                        Text(proxy.upstream).font(.callout.monospaced()).textSelection(.enabled)
+                        Button("Change…") {
+                            upstreamDraftState.wrappedValue = upstreamLabel(proxy.upstream)
+                            editingUpstream = proxy.name
+                        }
+                        .controlSize(.small)
+                    }
+                }
+                proxyCommandFields(proxy)
+                Text(proxy.command == nil
+                     ? "Every request passes to the upstream with its Host header, WebSocket upgrades (hot reload) included. Start the server as usual, or give the proxy a command so Flock starts it. Until it answers, \(proxy.domain) shows a page saying so."
+                     : "Every request passes to the upstream with its Host header, WebSocket upgrades (hot reload) included. Flock runs the command when you click Start, with Flock's PHP and Node.js on PATH and PORT set, and keeps it running until you click Stop or quit Flock.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let command = proxy.command {
+                ProxyOutput(log: command.log, running: command.state == .starting || command.state == .running) {
+                    model.logs.requested = .service(command.log)
+                    openWindow.activating(WindowID.logs)
+                }
+            }
+        }
+    }
+
+    /// Start or Stop for a proxy with a command.
+    @ViewBuilder
+    private func proxyStartStop(_ proxy: Status.Proxy, _ command: Status.ProxyCommand) -> some View {
+        let started = command.state == .starting || command.state == .running
+        Button(started ? "Stop" : "Start") {
+            restarting = proxy.name
+            Task {
+                await model.settings.perform { [name = proxy.name] client in
+                    _ = started ? try await client.stopProxy(name) : try await client.startProxy(name)
+                }
+                restarting = nil
+            }
+        }
+        .controlSize(.small)
+        .disabled(restarting == proxy.name)
+        .help(started ? (command.stopCommand.isEmpty ? "Stop \(command.command)" : "Run \(command.stopCommand)") : "Run \(command.command) in \(command.dir)")
+        if restarting == proxy.name {
+            ProgressView().controlSize(.mini)
+        }
+    }
+
+    /// A proxy's command, the folder it runs in and its stop command.
+    @ViewBuilder
+    private func proxyCommandFields(_ proxy: Status.Proxy) -> some View {
+        let key = "proxy:" + proxy.name
+        let saved = proxy.command?.command ?? ""
+        field("Command") {
+            HStack(spacing: 6) {
+                TextField("Optional, e.g. npm run dev", text: Binding(
+                    get: { commandDrafts[key] ?? saved },
+                    set: { commandDrafts[key] = $0 }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.callout.monospaced())
+                .onSubmit { saveProxyCommand(proxy) }
+                if let draft = commandDrafts[key], draft != saved {
+                    Button("Save") { saveProxyCommand(proxy) }.controlSize(.small)
+                }
+            }
+        }
+        if let command = proxy.command {
+            field("Folder") {
+                HStack(spacing: 8) {
+                    Text(abbreviatingHome(command.dir)).font(.callout).lineLimit(1).truncationMode(.middle)
+                        .help(command.dir)
+                    Button("Choose…") {
+                        guard let dir = SettingsStore.chooseDirectories(prompt: "Choose", multiple: false, in: URL(fileURLWithPath: command.dir),
+                                                                      message: "The folder \(command.command) runs in").first else { return }
+                        Task { await model.settings.perform { _ = try await $0.setProxyCommand(proxy.name, command: command.command, dir: dir.path, stopCommand: command.stopCommand) } }
+                    }
+                    .controlSize(.small)
+                }
+            }
+            let stopKey = "proxy-stop:" + proxy.name
+            field("Stop command") {
+                HStack(spacing: 6) {
+                    TextField("Only for a server it starts in the background", text: Binding(
+                        get: { commandDrafts[stopKey] ?? command.stopCommand },
+                        set: { commandDrafts[stopKey] = $0 }
+                    ))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                    .onSubmit { saveProxyCommand(proxy) }
+                    if let draft = commandDrafts[stopKey], draft != command.stopCommand {
+                        Button("Save") { saveProxyCommand(proxy) }.controlSize(.small)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Saves the Command and Stop command typed for a proxy. A new command runs in the folder of
+    /// the same name in a project folder when there is one, else in the home folder.
+    private func saveProxyCommand(_ proxy: Status.Proxy) {
+        let key = "proxy:" + proxy.name, stopKey = "proxy-stop:" + proxy.name
+        let command = (commandDrafts[key] ?? proxy.command?.command ?? "").trimmingCharacters(in: .whitespaces)
+        let stopCommand = command.isEmpty ? "" : (commandDrafts[stopKey] ?? proxy.command?.stopCommand ?? "").trimmingCharacters(in: .whitespaces)
+        commandDrafts[key] = nil
+        commandDrafts[stopKey] = nil
+        let dir = proxy.command?.dir ?? defaultProxyFolder(proxy.name)
+        Task { await model.settings.perform { _ = try await $0.setProxyCommand(proxy.name, command: command, dir: dir, stopCommand: stopCommand) } }
+    }
+
+    private func defaultProxyFolder(_ name: String) -> String {
+        for parked in model.settings.config?.parked ?? [] {
+            var isDirectory: ObjCBool = false
+            let dir = (parked as NSString).appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: dir, isDirectory: &isDirectory), isDirectory.boolValue {
+                return dir
+            }
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.path
+    }
+
+    private func abbreviatingHome(_ path: String) -> String {
+        (path as NSString).abbreviatingWithTildeInPath
+    }
+
+    private func proxyStateText(_ proxy: Status.Proxy) -> String {
+        switch proxy.command?.state {
+        case .starting: return "Starting…"
+        case .failed: return "Not running"
+        case .running, .stopped, .unknown, nil:
+            return proxy.running ? proxy.server ?? "Running" : "Not running"
+        }
+    }
+
+    private func proxyStateColor(_ proxy: Status.Proxy) -> Color {
+        switch proxy.command?.state {
+        case .starting: .yellow
+        case .failed: .orange
+        default: proxy.running ? .green : Color.secondary.opacity(0.5)
+        }
+    }
+
     /// A worktree in the list, indented under its site: its branch, and how its setup goes.
     private func worktreeRow(_ worktree: Status.Site) -> some View {
         HStack(spacing: 6) {
@@ -264,8 +577,10 @@ struct SitesPane: View {
                         .disabled(site.url == nil)
                     Button { reveal(site.path) } label: { Image(systemName: "folder") }
                         .help("Show in Finder")
-                    Button { extensionsState.wrappedValue = site } label: { Image(systemName: "puzzlepiece.extension") }
-                        .help("PHP extensions")
+                    if site.server != .node {
+                        Button { extensionsState.wrappedValue = site } label: { Image(systemName: "puzzlepiece.extension") }
+                            .help("PHP extensions")
+                    }
                     pinMenu(site)
                     if !site.parked {
                         Button {
@@ -330,10 +645,13 @@ struct SitesPane: View {
                         .font(.caption).foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                field("Root") {
-                    rootPicker(site)
+                // A Node.js app's dev server serves everything; it has no document root.
+                if site.server != .node {
+                    field("Root") {
+                        rootPicker(site)
+                    }
+                    rootHints(site)
                 }
-                rootHints(site)
             }
 
             section("Share") {
@@ -341,10 +659,12 @@ struct SitesPane: View {
             }
 
             section("Versions") {
-                field("PHP") {
-                    versionPicker(label: "PHP", current: site.php, source: site.phpSource, pinned: site.phpPinned, file: site.phpFile,
-                                  defaultVersion: store.config?.defaultPHP ?? "", installed: phpVersions) { version in
-                        Task { await store.perform { _ = try await $0.updateSite(site.name, SiteChange(php: version)) } }
+                if site.server != .node {
+                    field("PHP") {
+                        versionPicker(label: "PHP", current: site.php, source: site.phpSource, pinned: site.phpPinned, file: site.phpFile,
+                                      defaultVersion: store.config?.defaultPHP ?? "", installed: phpVersions) { version in
+                            Task { await store.perform { _ = try await $0.updateSite(site.name, SiteChange(php: version)) } }
+                        }
                     }
                 }
                 field("Node.js") {
@@ -354,7 +674,9 @@ struct SitesPane: View {
                     }
                 }
                 hints(site)
-                Text("A version picked here applies on this machine only. To set it for everyone working on the project, pin it (\(Image(systemName: "pin"))): PHP goes into .flockrc, Node.js into .nvmrc.")
+                Text(site.server == .node
+                     ? "A version picked here applies on this machine only, and restarts the dev server. To set it for everyone working on the project, pin it (\(Image(systemName: "pin"))) into .nvmrc."
+                     : "A version picked here applies on this machine only. To set it for everyone working on the project, pin it (\(Image(systemName: "pin"))): PHP goes into .flockrc, Node.js into .nvmrc.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -535,9 +857,14 @@ struct SitesPane: View {
                 Text("PHP-FPM").tag(Status.Server.fastcgi)
                 Text("FrankenPHP").tag(Status.Server.frankenphp)
                     .disabled(!site.supportsFrankenPHP && site.server != .frankenphp)
+                Text("Node.js (npm run dev)").tag(Status.Server.node)
             }
             .labelsHidden()
             .fixedSize()
+        }
+
+        if site.server == .node {
+            nodeServerFields(site)
         }
 
         if site.server == .frankenphp {
@@ -578,11 +905,105 @@ struct SitesPane: View {
             .controlSize(.small)
         }
 
-        Text(site.server == .frankenphp && !site.octaneAvailable
-             ? "FrankenPHP needs PHP 8.2 or newer. Requests that ask for Xdebug still go to PHP-FPM. For worker mode, install Laravel Octane in the project (composer require laravel/octane)."
-             : "FrankenPHP needs PHP 8.2 or newer. Requests that ask for Xdebug still go to PHP-FPM.")
+        if site.server != .node {
+            Text(site.server == .frankenphp && !site.octaneAvailable
+                 ? "FrankenPHP needs PHP 8.2 or newer. Requests that ask for Xdebug still go to PHP-FPM. For worker mode, install Laravel Octane in the project (composer require laravel/octane)."
+                 : "FrankenPHP needs PHP 8.2 or newer. Requests that ask for Xdebug still go to PHP-FPM. A Node.js app (Next.js, Nuxt, Vite): Flock runs its npm run dev.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// A Node.js site's dev server: whether it runs, on which Node.js and port, and its log and restart.
+    @ViewBuilder
+    private func nodeServerFields(_ site: Status.Site) -> some View {
+        let store = model.settings
+        let ns = site.nodeServer
+        field("Dev server") {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(nodeStateColor(ns?.state))
+                        .frame(width: 7, height: 7)
+                    Text(nodeStateText(ns))
+                }
+                if let ns, !ns.problem.isEmpty, ns.state == .failed || ns.state == .unavailable {
+                    Text(ns.problem).font(.caption).foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        HStack(spacing: 8) {
+            Button("Restart") {
+                restarting = site.name
+                Task {
+                    await store.perform { _ = try await $0.restartSite(site.name) }
+                    restarting = nil
+                }
+            }
+            .disabled(ns == nil || ns?.state == .unavailable || restarting == site.name)
+            .help("Restart \(ns?.command ?? "the dev server")")
+            Button("Show Log") {
+                model.logs.requested = .service(ns?.log ?? "node-\(site.name)")
+                openWindow.activating(WindowID.logs)
+            }
+            if restarting == site.name {
+                ProgressView().controlSize(.mini)
+            }
+        }
+        .controlSize(.small)
+        field("Command") {
+            HStack(spacing: 6) {
+                TextField("npm run dev", text: Binding(
+                    get: { commandDrafts[site.name] ?? savedCommand(ns) },
+                    set: { commandDrafts[site.name] = $0 }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.callout.monospaced())
+                .onSubmit { saveCommand(site) }
+                if let draft = commandDrafts[site.name], draft != savedCommand(ns) {
+                    Button("Save") { saveCommand(site) }.controlSize(.small)
+                }
+            }
+        }
+        Text("Flock runs \(ns.map { $0.command.isEmpty ? "npm run dev" : $0.command } ?? "npm run dev") in the project with the Node.js under Versions, restarts it when it exits, and serves the site's domains and HTTPS from it, hot reload included. A Node.js version picked or pinned here restarts it. Leave the command empty for npm run dev; {port} in it becomes the dev server's port, and PORT is set too.")
             .font(.caption).foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// The site's own command as set ({port} and all), "" when it runs npm run dev.
+    private func savedCommand(_ ns: Status.SiteNodeServer?) -> String {
+        guard let ns, ns.custom else { return "" }
+        return ns.configured.isEmpty ? ns.command : ns.configured
+    }
+
+    /// Saves the Command typed for a Node.js site ("" goes back to npm run dev).
+    private func saveCommand(_ site: Status.Site) {
+        guard let draft = commandDrafts[site.name] else { return }
+        let command = draft.trimmingCharacters(in: .whitespaces)
+        commandDrafts[site.name] = nil
+        Task { await model.settings.perform { _ = try await $0.updateSite(site.name, SiteChange(command: command)) } }
+    }
+
+    private func nodeStateText(_ ns: Status.SiteNodeServer?) -> String {
+        guard let ns else { return "Starting…" }
+        switch ns.state {
+        case .running: return "Running on Node.js \(ns.version) — port \(ns.port)"
+        case .starting: return "Starting on Node.js \(ns.version)…"
+        case .failed: return "Not running"
+        case .unavailable: return "Node.js isn't installed"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    private func nodeStateColor(_ state: Status.SiteNodeServer.State?) -> Color {
+        switch state {
+        case .running: .green
+        case .starting: .yellow
+        case .failed, .unavailable: .orange
+        default: .secondary
+        }
     }
 
     /// The FrankenPHP process: running, downloading its build, or why PHP-FPM serves the site.
@@ -713,7 +1134,9 @@ struct SitesPane: View {
             VStack(alignment: .leading, spacing: 6) {
                 Button("Share…") { sharing = site.name }
                     .disabled(site.url == nil)
-                Text("Show the site at a temporary public address to preview work in progress, never for production. Visitors don't get debug pages, dumps or the dev tools.")
+                Text(site.server == .node
+                     ? "Show the app at a temporary public address to preview work in progress, never for production. Visitors reach its dev server, so they see what you see: its error overlay and source maps included."
+                     : "Show the site at a temporary public address to preview work in progress, never for production. Visitors don't get debug pages, dumps or the dev tools.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -928,6 +1351,64 @@ struct SitesPane: View {
 }
 
 /// A change waiting for confirmation: a pin or unpin (it changes files in the project), or a removal.
+/// A proxy command's output, the tail of its log, refreshed while it runs.
+private struct ProxyOutput: View {
+    @Environment(AppModel.self) private var model
+    let log: String
+    let running: Bool
+    let openLog: () -> Void
+    private let textState = State<String>(initialValue: "")
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("Output").font(.headline)
+                Spacer()
+                Button("Clear") {
+                    Task {
+                        try? await model.client.clearServiceLog(log)
+                        textState.wrappedValue = ""
+                    }
+                }
+                .disabled(textState.wrappedValue.isEmpty)
+                Button("Open Log", action: openLog)
+            }
+            .controlSize(.small)
+            ScrollViewReader { scroller in
+                ScrollView {
+                    Group {
+                        if textState.wrappedValue.isEmpty {
+                            Text(running ? "Waiting for output…" : "Start the server to see its output here.")
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, minHeight: 160)
+                        } else {
+                            Text(textState.wrappedValue)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(8)
+                    Color.clear.frame(height: 1).id("end")
+                }
+                .frame(height: 220)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.separator))
+                .onChange(of: textState.wrappedValue) { scroller.scrollTo("end", anchor: .bottom) }
+            }
+        }
+        // Polled while it runs, and read once when it doesn't (the last run's output).
+        .task(id: "\(log) \(running)") {
+            repeat {
+                if let text = try? await model.client.serviceLog(log, lines: 300), text != textState.wrappedValue {
+                    textState.wrappedValue = text
+                }
+                try? await Task.sleep(for: .seconds(1))
+            } while running && !Task.isCancelled
+        }
+    }
+}
+
 private struct ConfirmAction: Identifiable, Sendable {
     let title: String
     let button: String

@@ -38,6 +38,8 @@ type Config struct {
 	Channel string   `json:"channel,omitempty"`
 	Parked  []string `json:"parked"`
 	Sites   []Site   `json:"sites"`
+	// Proxies are names served by a server of their own, e.g. a Node.js dev server (see Proxy).
+	Proxies []Proxy `json:"proxies,omitempty"`
 
 	// Worktrees are the git worktrees Flock sets up (see package worktree). WorktreesSince is when
 	// Flock first looked for worktrees: older ones are served, but only set up when asked.
@@ -136,48 +138,85 @@ type Site struct {
 	// for Path itself); empty means the project's .flockrc or detection decides (see project.RootFor).
 	Root string `json:"root,omitempty"`
 
-	// Server runs the site's PHP: "" through the version's FastCGI pool (PHP-FPM; php-cgi on
-	// Windows), or ServerFrankenPHP in a FrankenPHP process of its own on Port, behind the web server.
+	// Server runs the site: its PHP "" through the version's FastCGI pool (PHP-FPM; php-cgi on
+	// Windows), or ServerFrankenPHP in a FrankenPHP process of its own on Port, behind the web server;
+	// or ServerNode, the project's `npm run dev` (a Node.js app) on Port, with the site's Node.js.
 	Server string `json:"server,omitempty"`
 	// Worker is FrankenPHP's worker mode: "" (classic: every request boots the app) or WorkerOctane.
 	// It is kept while the site runs on FastCGI, for switching back.
 	Worker string `json:"worker,omitempty"`
-	Port   int    `json:"port,omitempty"` // FrankenPHP's loopback port, assigned by SetServer
+	Port   int    `json:"port,omitempty"` // FrankenPHP's or the dev server's loopback port, assigned by SetServer
+	// Command is a Node.js site's dev server, run in the project through the shell ("" runs
+	// `npm run dev`); {port} in it becomes the dev server's port. Kept while the site runs on PHP.
+	Command string `json:"command,omitempty"`
 }
 
 // Servers and worker modes of a site (see Site.Server and Site.Worker).
 const (
 	ServerFastCGI    = "fastcgi" // how the API and CLI name the default, stored as ""
 	ServerFrankenPHP = "frankenphp"
+	ServerNode       = "node"
 	WorkerOctane     = "octane"
 )
 
-// FirstSitePort is where the loopback ports of FrankenPHP sites start.
+// FirstSitePort is where the loopback ports of FrankenPHP and Node.js sites start.
 const FirstSitePort = 21000
 
 // SitePortID is how UsedPorts names the port of a FrankenPHP site: "frankenphp-<site>", which is
 // also the name of its process and log.
 func SitePortID(site string) string { return "frankenphp-" + site }
 
+// ValidCommand checks a command Flock runs: a Node.js site's dev server (see Site.Command) or a
+// proxy's (see Proxy.Command).
+func ValidCommand(command string) error {
+	switch {
+	case strings.ContainsAny(command, "\r\n\x00"):
+		return fmt.Errorf("the command must be one line")
+	case len(command) > 1000:
+		return fmt.Errorf("the command is too long")
+	}
+	return nil
+}
+
+// NodePortID is how UsedPorts names the port of a Node.js site: "node-<site>", which is also the
+// name of its process and log.
+func NodePortID(site string) string { return "node-" + site }
+
 // FrankenPHP reports whether the site runs on FrankenPHP.
 func (s Site) FrankenPHP() bool { return s.Server == ServerFrankenPHP }
 
-// SetServer switches site to server (ServerFastCGI, "" or ServerFrankenPHP) with worker ("" or
-// WorkerOctane), giving it a loopback port for FrankenPHP the first time. The site becomes linked
+// RunsNode reports whether the site is a Node.js app: Flock runs its `npm run dev`.
+func (s Site) RunsNode() bool { return s.Server == ServerNode }
+
+// portID names the process that uses the site's Port ("" when it uses none).
+func (s Site) portID() string {
+	switch {
+	case s.Port == 0:
+		return ""
+	case s.FrankenPHP():
+		return SitePortID(s.Name)
+	case s.RunsNode():
+		return NodePortID(s.Name)
+	}
+	return ""
+}
+
+// SetServer switches site to server (ServerFastCGI, "", ServerFrankenPHP or ServerNode) with worker
+// ("" or WorkerOctane, FrankenPHP only), giving it a loopback port for FrankenPHP or its dev server the first time. The site becomes linked
 // so the setting can be stored; the caller saves it with Upsert.
 func (c *Config) SetServer(site *Site, server, worker string) error {
 	switch server {
 	case ServerFastCGI, "":
 		server = ""
-	case ServerFrankenPHP:
+	case ServerFrankenPHP, ServerNode:
 	default:
-		return fmt.Errorf("unknown server %q (fastcgi or frankenphp)", server)
+		return fmt.Errorf("unknown server %q (fastcgi, frankenphp or node)", server)
 	}
 	if worker != "" && worker != WorkerOctane {
 		return fmt.Errorf("unknown worker mode %q (octane, or empty for classic)", worker)
 	}
 	site.Server, site.Worker, site.Parked = server, worker, false
-	if server == ServerFrankenPHP && (site.Port == 0 || c.portTaken(site.Port, site.Name)) {
+	if server != "" && (site.Port == 0 || c.portTaken(site.Port, site.Name)) {
 		site.Port = c.nextSitePort(site.Name)
 	}
 	return nil
@@ -187,7 +226,7 @@ func (c *Config) SetServer(site *Site, server, worker string) error {
 func (c *Config) portTaken(port int, site string) bool {
 	if _, used := c.UsedPorts("")[port]; used {
 		for _, s := range c.Sites {
-			if s.Name == site && s.Port == port && s.FrankenPHP() {
+			if s.Name == site && s.Port == port && s.portID() != "" {
 				return false
 			}
 		}
@@ -254,8 +293,8 @@ func (c *Config) UsedPorts(except string) map[int]string {
 		}
 	}
 	for _, s := range c.Sites {
-		if s.FrankenPHP() && s.Port != 0 {
-			used[s.Port] = SitePortID(s.Name)
+		if id := s.portID(); id != "" {
+			used[s.Port] = id
 		}
 	}
 	return used
@@ -302,7 +341,8 @@ func (c *Config) NodeFor(s Site) string {
 }
 
 // AllSites returns linked sites plus every directory found in parked paths, and the git worktrees
-// of both (see worktreeSites). A linked site wins over a parked directory with the same name.
+// of both (see worktreeSites). A linked site wins over a parked directory with the same name, and
+// so does a proxy: the directory isn't a site then.
 // Sorted by name, so a site's worktrees follow it.
 func (c *Config) AllSites() []Site {
 	byName := map[string]Site{}
@@ -317,6 +357,9 @@ func (c *Config) AllSites() []Site {
 				continue
 			}
 			name := SiteName(e.Name())
+			if _, proxied := c.FindProxy(name); proxied {
+				continue
+			}
 			byName[name] = Site{Name: name, Path: filepath.Join(dir, e.Name()), Parked: true}
 		}
 	}
@@ -377,6 +420,9 @@ func siteForDir(sites []Site, dir string, pathOf func(Site) string) (Site, bool)
 func (c *Config) Upsert(site Site) error {
 	if site.IsWorktree() {
 		return fmt.Errorf("%s is a git worktree of %s and uses its settings — change them on %s", site.Name, site.Parent, site.Parent)
+	}
+	if _, ok := c.FindProxy(site.Name); ok {
+		return fmt.Errorf("%s is a proxy's name — remove it with `flock unproxy %s` first, or choose another name", site.Name, site.Name)
 	}
 	for i, s := range c.Sites {
 		if s.Name == site.Name {

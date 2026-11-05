@@ -1,7 +1,7 @@
 //! The tray icon, a StatusNotifierItem: KDE shows them, Ubuntu's GNOME through its AppIndicator
 //! extension. Its icon follows the daemon's state like the Windows tray icon and the macOS menu
 //! bar icon. Trays only show menus, so the menu carries what the Windows and macOS panels show at a
-//! glance: the status, sites, Mail and Dumps counts and the Xdebug and dumps toggles. Desktops
+//! glance: the status, sites and proxies, Mail and Dumps counts and the Xdebug and dumps toggles. Desktops
 //! without a tray (GNOME without the extension) keep the main window instead.
 //!
 //! ksni serves the item from its own thread; the menu's actions come back to the GTK main loop
@@ -16,7 +16,7 @@ use ksni::blocking::{Handle, TrayMethods};
 use ksni::menu::{CheckmarkItem, MenuItem, StandardItem, SubMenu};
 
 use crate::APP_ID;
-use crate::api::{SettingsChange, SiteStatus, Status};
+use crate::api::{ProxyStatus, SettingsChange, SiteStatus, Status};
 use crate::model::AppModel;
 
 /// What the tray asks the app to do, on the main loop.
@@ -46,6 +46,8 @@ struct State {
     running: bool,
     /// The sites, each with its worktrees; problems are in the main window.
     sites: Vec<SiteItem>,
+    /// The proxies (`flock proxy`), after the sites.
+    proxies: Vec<SiteItem>,
     mail_count: u32,
     dump_count: u32,
     xdebug: bool,
@@ -69,6 +71,7 @@ impl State {
             warning: status.as_ref().and_then(|s| s.warnings.first().cloned()),
             needs_setup,
             sites: status.as_ref().map(SiteItem::all).unwrap_or_default(),
+            proxies: status.as_ref().map(|s| s.proxies.iter().map(SiteItem::proxy).collect()).unwrap_or_default(),
             mail_count: status.as_ref().map_or(0, |s| s.mail_count),
             dump_count: status.as_ref().map_or(0, |s| s.dump_count),
             xdebug: status.as_ref().is_some_and(|s| s.xdebug),
@@ -92,11 +95,25 @@ impl SiteItem {
             .top_sites()
             .into_iter()
             .map(|site| SiteItem {
-                label: site.domain.clone(),
+                label: Self::site_label(site),
                 url: site.url.clone(),
                 worktrees: status.worktrees_of(&site.name).into_iter().map(Self::worktree).collect(),
             })
             .collect()
+    }
+
+    /// "acme.test", or a Node.js app's "softpack.test · Node.js 22.23.4" ("· Not running").
+    fn site_label(site: &SiteStatus) -> String {
+        if !site.is_node() {
+            return site.domain.clone();
+        }
+        let server = site.node_server.as_ref().map_or_else(|| "Node.js".to_owned(), |ns| ns.short_text());
+        format!("{} · {server}", site.domain)
+    }
+
+    /// "softpack.test · Node.js 22.23.4": what answers at the upstream, or "· Not running".
+    fn proxy(proxy: &ProxyStatus) -> Self {
+        SiteItem { label: format!("{} · {}", proxy.domain, proxy.server_text()), url: proxy.url.clone(), worktrees: Vec::new() }
     }
 
     /// "feature/auth", with its own database ("· copy") and its setup ("· Composer install…").
@@ -179,6 +196,12 @@ impl FlockTray {
                 SubMenu { label: label(&counted(&site.label, site.worktrees.len() as u32)), submenu: items, ..Default::default() }.into()
             })
             .collect();
+        if !self.state.proxies.is_empty() {
+            if !submenu.is_empty() {
+                submenu.push(MenuItem::Separator);
+            }
+            submenu.extend(self.state.proxies.iter().map(open));
+        }
         if submenu.is_empty() {
             submenu.push(text("No sites yet"));
         }
@@ -328,4 +351,28 @@ fn follow(model: &Rc<AppModel>, tray: Handle<FlockTray>, shown: State) {
     // The status may have come in while the tray registered.
     update();
     model.subscribe(update);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn labels_node_sites_and_proxies() {
+        let status: Status = serde_json::from_str(
+            r#"{"sites":[{"name":"acme","domain":"acme.test","server":"fastcgi"},
+                {"name":"softpack","domain":"softpack.test","server":"node","url":"http://softpack.test",
+                  "node_server":{"state":"running","version":"22.23.4","port":21001}},
+                {"name":"broken","domain":"broken.test","server":"node","node_server":{"state":"failed","problem":"exited"}}],
+              "proxies":[{"name":"blog","domain":"blog.test","upstream":"http://127.0.0.1:3000","url":"http://blog.test","running":false},
+                {"name":"minio","domain":"minio.test","upstream":"http://127.0.0.1:9000","running":true}]}"#,
+        )
+        .unwrap();
+        let labels: Vec<String> = SiteItem::all(&status).into_iter().map(|s| s.label).collect();
+        assert_eq!(labels, ["acme.test", "softpack.test · Node.js 22.23.4", "broken.test · Not running"]);
+        let proxies: Vec<SiteItem> = status.proxies.iter().map(SiteItem::proxy).collect();
+        assert_eq!(proxies[0].label, "blog.test · Not running");
+        assert_eq!(proxies[0].url.as_deref(), Some("http://blog.test"));
+        assert_eq!(proxies[1].label, "minio.test · Running");
+    }
 }

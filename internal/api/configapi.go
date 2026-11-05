@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"flock/internal/binaries"
@@ -250,6 +251,8 @@ func registerConfig(mux *http.ServeMux, b Backend) {
 			// Root is the document root on this machine, relative to the project ("" lets the
 			// project's .flockrc or detection decide again).
 			Root *string `json:"root"`
+			// Command is a Node.js site's dev server ("" runs `npm run dev`; see config.Site.Command).
+			Command *string `json:"command"`
 		}
 		if err := decodeBody(r, &body); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -287,6 +290,13 @@ func registerConfig(mux *http.ServeMux, b Backend) {
 					}
 					site.Root = root
 				}
+			}
+			if body.Command != nil {
+				command := strings.TrimSpace(*body.Command)
+				if err := config.ValidCommand(command); err != nil {
+					return invalid("%v", err)
+				}
+				site.Command = command
 			}
 			if body.Server != nil || body.Worker != nil {
 				server, worker := site.Server, site.Worker
@@ -402,6 +412,75 @@ func registerConfig(mux *http.ServeMux, b Backend) {
 			}
 			if !cfg.Remove(r.PathValue("name")) {
 				return fmt.Errorf("%w: %s is served from a parked directory; remove its parent from the project folders instead", errConflict, r.PathValue("name"))
+			}
+			return nil
+		})
+	})
+
+	// A proxy passes its name to a server of its own (see config.Proxy). Secured is kept when left out.
+	mux.HandleFunc("POST /v1/proxies", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Name     string `json:"name"`
+			Upstream string `json:"upstream"`
+			ProxyOptions
+		}
+		if err := decodeBody(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		mutate(w, func(cfg *config.Config) error {
+			upstream, err := config.NormalizeUpstream(body.Upstream)
+			if err != nil {
+				return invalid("%v", err)
+			}
+			p := config.Proxy{Name: config.SiteName(body.Name), Upstream: upstream}
+			if existing, ok := cfg.FindProxy(p.Name); ok {
+				p = existing
+				p.Upstream = upstream
+			}
+			body.apply(&p)
+			if err := cfg.UpsertProxy(p); err != nil {
+				return invalid("%v", err)
+			}
+			return nil
+		})
+	})
+
+	mux.HandleFunc("PATCH /v1/proxies/{name}", func(w http.ResponseWriter, r *http.Request) {
+		var body ProxyOptions
+		if err := decodeBody(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		mutate(w, func(cfg *config.Config) error {
+			p, ok := cfg.FindProxy(r.PathValue("name"))
+			if !ok {
+				return invalid("no proxy named %q", r.PathValue("name"))
+			}
+			body.apply(&p)
+			if err := cfg.UpsertProxy(p); err != nil {
+				return invalid("%v", err)
+			}
+			return nil
+		})
+	})
+
+	proxyAction := func(act func(string) error) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if err := act(r.PathValue("name")); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, b.Status())
+		}
+	}
+	mux.HandleFunc("POST /v1/proxies/{name}/start", proxyAction(b.StartProxy))
+	mux.HandleFunc("POST /v1/proxies/{name}/stop", proxyAction(b.StopProxy))
+
+	mux.HandleFunc("DELETE /v1/proxies/{name}", func(w http.ResponseWriter, r *http.Request) {
+		mutate(w, func(cfg *config.Config) error {
+			if !cfg.RemoveProxy(r.PathValue("name")) {
+				return invalid("no proxy named %q", r.PathValue("name"))
 			}
 			return nil
 		})
@@ -534,6 +613,7 @@ type SiteChange struct {
 	Server  *string `json:"server,omitempty"`
 	Worker  *string `json:"worker,omitempty"`
 	Root    *string `json:"root,omitempty"`
+	Command *string `json:"command,omitempty"`
 }
 
 // Config fetches config.json plus the installed versions.
@@ -565,6 +645,76 @@ func (c *Client) SetServiceRunning(ctx context.Context, id string, on bool) ([]S
 func (c *Client) LinkSite(ctx context.Context, dir, name string) (Status, error) {
 	var out Status
 	err := c.send(ctx, http.MethodPost, "/v1/sites", map[string]string{"path": dir, "name": name}, &out)
+	return out, err
+}
+
+// ProxyOptions are a proxy's settings besides its upstream. What's left out (nil) is kept: a new
+// proxy is served over HTTP, without a command.
+type ProxyOptions struct {
+	Secured *bool `json:"secured,omitempty"`
+	// Command starts the proxy's server, in Dir (absolute); StopCommand stops it when Command
+	// starts it in the background (see config.Proxy). An empty Command removes them.
+	Command     *string `json:"command,omitempty"`
+	Dir         *string `json:"dir,omitempty"`
+	StopCommand *string `json:"stop_command,omitempty"`
+}
+
+func (o ProxyOptions) apply(p *config.Proxy) {
+	if o.Secured != nil {
+		p.Secured = *o.Secured
+	}
+	if o.Command != nil {
+		p.Command = *o.Command
+	}
+	if o.Dir != nil {
+		p.Dir = *o.Dir
+	}
+	if o.StopCommand != nil {
+		p.StopCommand = *o.StopCommand
+	}
+	if strings.TrimSpace(p.Command) == "" {
+		p.StopCommand = ""
+	}
+}
+
+// Proxy serves <name>.<tld> from upstream (a port, host:port or URL; see config.NormalizeUpstream),
+// adding the proxy or changing its upstream and the options given.
+func (c *Client) Proxy(ctx context.Context, name, upstream string, opts ProxyOptions) (Status, error) {
+	body := struct {
+		Name     string `json:"name"`
+		Upstream string `json:"upstream"`
+		ProxyOptions
+	}{name, upstream, opts}
+	var out Status
+	err := c.send(ctx, http.MethodPost, "/v1/proxies", body, &out)
+	return out, err
+}
+
+// SecureProxy serves a proxy over HTTPS (on) or plain HTTP.
+func (c *Client) SecureProxy(ctx context.Context, name string, on bool) (Status, error) {
+	var out Status
+	err := c.send(ctx, http.MethodPatch, "/v1/proxies/"+url.PathEscape(name), map[string]bool{"secured": on}, &out)
+	return out, err
+}
+
+// StartProxy runs a proxy's command.
+func (c *Client) StartProxy(ctx context.Context, name string) (Status, error) {
+	var out Status
+	err := c.timeout(time.Minute).do(ctx, http.MethodPost, "/v1/proxies/"+url.PathEscape(name)+"/start", &out)
+	return out, err
+}
+
+// StopProxy stops a proxy's command, or runs its stop command.
+func (c *Client) StopProxy(ctx context.Context, name string) (Status, error) {
+	var out Status
+	err := c.timeout(2*time.Minute).do(ctx, http.MethodPost, "/v1/proxies/"+url.PathEscape(name)+"/stop", &out)
+	return out, err
+}
+
+// RemoveProxy stops serving a proxy.
+func (c *Client) RemoveProxy(ctx context.Context, name string) (Status, error) {
+	var out Status
+	err := c.send(ctx, http.MethodDelete, "/v1/proxies/"+url.PathEscape(name), nil, &out)
 	return out, err
 }
 

@@ -1,0 +1,28 @@
+# Issues opened by people without repository access need a maintainer's first review.
+name: Issue Triage
+
+on:
+    issues:
+        types: [ opened ]
+
+permissions:
+    contents: read
+    issues: write
+
+jobs:
+    label:
+        name: Label for triage
+        runs-on: ubuntu-latest
+        steps:
+            -   uses: actions/checkout@v7
+                with:
+                    ref: ${{ github.event.repository.default_branch }}
+
+            -   uses: actions/setup-go@v7
+                with:
+                    go-version-file: go.mod
+
+            -   name: Evaluate
+                run: go run ./tools/github-gate issue
+                env:
+                    GITHUB_TOKEN: ${{ github.token }}

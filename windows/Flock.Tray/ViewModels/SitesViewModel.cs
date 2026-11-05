@@ -7,18 +7,29 @@ using Microsoft.UI.Xaml;
 
 namespace Flock.Tray.ViewModels;
 
-/// <summary>Retained site and domain rows over the daemon's accepted status snapshot.</summary>
+/// <summary>
+/// Retained site, domain and proxy rows over the daemon's accepted status snapshot. Site and proxy
+/// names never clash (the daemon refuses it), so one selection covers both: Selected or SelectedProxy.
+/// </summary>
 internal sealed partial class SitesViewModel(SitesService service) : ObservableObject
 {
     private readonly CollectionSynchronizer<string, SiteRowViewModel> _synchronizer = new();
+    private readonly CollectionSynchronizer<string, ProxyRowViewModel> _proxySynchronizer = new();
 
     public SitesService Service { get; } = service;
     public ObservableCollection<SiteRowViewModel> Sites { get; } = [];
+    /// <summary>Proxies (`flock proxy`), listed under the sites.</summary>
+    public ObservableCollection<ProxyRowViewModel> Proxies { get; } = [];
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(Error))]
     public partial SiteRowViewModel? Selected { get; private set; }
-    public string? Error => Selected is { } row ? Service.ErrorFor(row.Name) : Service.Error;
-    public bool HasSites => Sites.Count > 0;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(Error))]
+    public partial ProxyRowViewModel? SelectedProxy { get; private set; }
+    public string? Error => (Selected?.Name ?? SelectedProxy?.Name) is { } name ? Service.ErrorFor(name) : Service.Error;
+    /// <summary>Anything to list: a site or a proxy (else the pane shows its empty state).</summary>
+    public bool HasSites => Sites.Count > 0 || Proxies.Count > 0;
+    public bool HasProxies => Proxies.Count > 0;
 
     public event Action? SelectionChanged;
 
@@ -29,6 +40,7 @@ internal sealed partial class SitesViewModel(SitesService service) : ObservableO
             return false;
         }
         var selectedBefore = Selected;
+        var proxyBefore = SelectedProxy;
         var worktreesBefore = WorktreeNames(selectedBefore);
         var selectedChanged = false;
         // Each site's worktrees right after it, so the list nests them.
@@ -42,13 +54,34 @@ internal sealed partial class SitesViewModel(SitesService service) : ObservableO
                     selectedChanged |= changed;
                 }
             });
-        if (Selected is null || !Sites.Contains(Selected))
+        _proxySynchronizer.Synchronize(Proxies, status.Proxies, proxy => proxy.Name, proxy => proxy.Name,
+            proxy => new ProxyRowViewModel(proxy), (row, proxy) =>
+            {
+                var changed = row.Apply(proxy);
+                if (ReferenceEquals(row, proxyBefore))
+                {
+                    selectedChanged |= changed;
+                }
+            });
+        // A proxy that is still listed stays selected.
+        var proxyListed = SelectedProxy is not null && Proxies.Contains(SelectedProxy);
+        if (!proxyListed && (Selected is null || !Sites.Contains(Selected)))
         {
-            Select(Sites.FirstOrDefault());
+            // The first site, or the first proxy when there are only proxies.
+            if (Sites.FirstOrDefault() is { } first)
+            {
+                Select(first);
+            }
+            else
+            {
+                Select(Proxies.FirstOrDefault());
+            }
         }
         OnPropertyChanged(nameof(Error));
         OnPropertyChanged(nameof(HasSites));
-        return !ReferenceEquals(selectedBefore, Selected) || selectedChanged || !worktreesBefore.SequenceEqual(WorktreeNames(selectedBefore));
+        OnPropertyChanged(nameof(HasProxies));
+        return !ReferenceEquals(selectedBefore, Selected) || !ReferenceEquals(proxyBefore, SelectedProxy) || selectedChanged
+               || !worktreesBefore.SequenceEqual(WorktreeNames(selectedBefore));
     }
 
     private List<string> WorktreeNames(SiteRowViewModel? site) =>
@@ -56,15 +89,66 @@ internal sealed partial class SitesViewModel(SitesService service) : ObservableO
 
     public void Select(SiteRowViewModel? row)
     {
-        if (ReferenceEquals(Selected, row))
+        if (ReferenceEquals(Selected, row) && (row is not null || SelectedProxy is null))
         {
             return;
         }
+        SelectedProxy = null;
         Selected = row;
         SelectionChanged?.Invoke();
     }
 
-    public void Select(string? name) => Select(name is null ? null : Sites.FirstOrDefault(site => site.Name == name));
+    public void Select(ProxyRowViewModel? row)
+    {
+        if (ReferenceEquals(SelectedProxy, row) && (row is not null || Selected is null))
+        {
+            return;
+        }
+        Selected = null;
+        SelectedProxy = row;
+        SelectionChanged?.Invoke();
+    }
+
+    /// <summary>Selects the site or proxy of that name.</summary>
+    public void Select(string? name)
+    {
+        if (name is not null && Proxies.FirstOrDefault(proxy => proxy.Name == name) is { } proxy)
+        {
+            Select(proxy);
+            return;
+        }
+        Select(name is null ? null : Sites.FirstOrDefault(site => site.Name == name));
+    }
+}
+
+/// <summary>A stable proxy row over its status DTO.</summary>
+public sealed partial class ProxyRowViewModel(Status.Proxy proxy) : ObservableObject
+{
+    public Status.Proxy Snapshot { get; private set; } = proxy;
+
+    public string Name => Snapshot.Name;
+    public string Domain => Snapshot.Domain;
+    /// <summary>"app.test → 127.0.0.1:3000".</summary>
+    public string Route => $"{Snapshot.Domain} → {Snapshot.UpstreamLabel}";
+    public string Upstream => Snapshot.Upstream;
+    public bool Secured => Snapshot.Secured;
+    public bool Running => Snapshot.Running;
+    public string ServerLabel => Snapshot.ServerLabel;
+    public string? Problem => Snapshot.Problem;
+    public bool HasProblem => Snapshot.Problem is not null;
+
+    internal bool Apply(Status.Proxy value)
+    {
+        var previous = Snapshot;
+        Snapshot = value;
+        OnPropertyChanged(string.Empty);
+        return previous.Name != value.Name || previous.Domain != value.Domain || previous.Upstream != value.Upstream
+               || previous.Secured != value.Secured || previous.Url != value.Url || previous.Problem != value.Problem
+               || previous.Running != value.Running || previous.Server != value.Server
+               || previous.Command?.Command != value.Command?.Command || previous.Command?.Dir != value.Command?.Dir
+               || previous.Command?.StopCommand != value.Command?.StopCommand || previous.Command?.State != value.Command?.State
+               || previous.Command?.Problem != value.Command?.Problem;
+    }
 }
 
 
@@ -109,6 +193,9 @@ public sealed partial class SiteRowViewModel : ObservableObject
     public Status.SiteFrankenPhp? FrankenPhp => Snapshot.FrankenPhp;
     public string Boost => Snapshot.Boost;
     public bool IsFrankenPhp => Server == Status.SiteServer.FrankenPhp;
+    /// <summary>A Node.js app, served from its npm run dev.</summary>
+    public bool IsNode => Server == Status.SiteServer.Node;
+    public Status.SiteNodeServer? NodeServer => Snapshot.NodeServer;
     public bool PhpPinnedHere => Snapshot.PhpPinnedHere;
     public bool NodePinnedHere => Snapshot.NodePinnedHere;
     public bool IsShared => Snapshot.IsShared;
@@ -190,7 +277,7 @@ public sealed partial class SiteRowViewModel : ObservableObject
                 Domains.Insert(index, row);
             }
         }
-        foreach (var property in new[] { nameof(Name), nameof(Domain), nameof(Path), nameof(Url), nameof(Secured), nameof(Php), nameof(Node), nameof(Server), nameof(Worker), nameof(Parked), nameof(PhpSource), nameof(PhpPinned), nameof(PhpFile), nameof(NodeSource), nameof(NodePinned), nameof(NodeFile), nameof(NodeShadowed), nameof(Problem), nameof(OctaneAvailable), nameof(FrankenPhp), nameof(Boost), nameof(IsFrankenPhp), nameof(PhpPinnedHere), nameof(NodePinnedHere), nameof(IsShared), nameof(ListTitle), nameof(ListMargin), nameof(IsSettingUp), nameof(SetupStep), nameof(HasOwnDatabase), nameof(DatabaseLabel), nameof(DatabaseTooltip) })
+        foreach (var property in new[] { nameof(Name), nameof(Domain), nameof(Path), nameof(Url), nameof(Secured), nameof(Php), nameof(Node), nameof(Server), nameof(Worker), nameof(Parked), nameof(PhpSource), nameof(PhpPinned), nameof(PhpFile), nameof(NodeSource), nameof(NodePinned), nameof(NodeFile), nameof(NodeShadowed), nameof(Problem), nameof(OctaneAvailable), nameof(FrankenPhp), nameof(Boost), nameof(IsFrankenPhp), nameof(IsNode), nameof(NodeServer), nameof(PhpPinnedHere), nameof(NodePinnedHere), nameof(IsShared), nameof(ListTitle), nameof(ListMargin), nameof(IsSettingUp), nameof(SetupStep), nameof(HasOwnDatabase), nameof(DatabaseLabel), nameof(DatabaseTooltip) })
         {
             OnPropertyChanged(property);
         }
@@ -203,7 +290,8 @@ public sealed partial class SiteRowViewModel : ObservableObject
                ?? (site.Worktree is { IsFailed: true, Error.Length: > 0 } setup ? setup.Error : null)
                ?? site.Notice
                ?? site.Domains.Select(domain => domain.Problem is { } problem ? $"{domain.Host}: {problem}" : null).FirstOrDefault(problem => problem is not null)
-               ?? (site.IsFrankenPhp && site.FrankenPhp is { IsRunning: false, IsInstalling: false, Problem.Length: > 0 } frankenPhp ? frankenPhp.Problem : null);
+               ?? (site.IsFrankenPhp && site.FrankenPhp is { IsRunning: false, IsInstalling: false, Problem.Length: > 0 } frankenPhp ? frankenPhp.Problem : null)
+               ?? (site.IsNode && site.NodeServer is { IsFailed: true, Problem.Length: > 0 } nodeServer ? nodeServer.Problem : null);
     }
 
     private static bool RenderedFieldsChanged(Status.Site previous, Status.Site current)
@@ -236,6 +324,7 @@ public sealed partial class SiteRowViewModel : ObservableObject
                || previous.Worker != current.Worker
                || previous.OctaneAvailable != current.OctaneAvailable
                || !FrankenPhpEqual(previous.FrankenPhp, current.FrankenPhp)
+               || !NodeServerEqual(previous.NodeServer, current.NodeServer)
                || previous.Boost != current.Boost
                || !ShareEqual(previous.Share, current.Share)
                || previous.Parent != current.Parent
@@ -262,6 +351,14 @@ public sealed partial class SiteRowViewModel : ObservableObject
         return previous is null && current is null || previous is not null && current is not null &&
             previous.State == current.State && previous.Version == current.Version && previous.PhpVersion == current.PhpVersion &&
             previous.Port == current.Port && previous.Progress == current.Progress && previous.Problem == current.Problem && previous.Log == current.Log;
+    }
+
+    private static bool NodeServerEqual(Status.SiteNodeServer? previous, Status.SiteNodeServer? current)
+    {
+        return previous is null && current is null || previous is not null && current is not null &&
+            previous.State == current.State && previous.Version == current.Version && previous.Script == current.Script &&
+            previous.Port == current.Port && previous.Problem == current.Problem && previous.Log == current.Log &&
+            previous.Command == current.Command && previous.Custom == current.Custom && previous.Configured == current.Configured;
     }
 
     private static bool ShareEqual(Status.SiteShare? previous, Status.SiteShare? current)

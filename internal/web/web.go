@@ -32,14 +32,21 @@ type Site struct {
 	// there, and with Debugging (the project has breakpoints) every request does.
 	DebugFPM  []string
 	Debugging bool
-	// Proxy is the loopback address of the site's own FrankenPHP ("127.0.0.1:<port>"). When set, requests
-	// go there instead of to FPM; those that ask for Xdebug still go to DebugFPM.
+	// Proxy is the loopback address of the site's own FrankenPHP ("127.0.0.1:<port>"), or the server
+	// of a proxied name (config.Proxy: "http://127.0.0.1:3000", no Root). When set, requests go there
+	// instead of to FPM; those that ask for Xdebug still go to DebugFPM.
 	Proxy string
+	// Down, when set, says why the site's own server can't run (a Node.js app's dev server, e.g.
+	// its port is taken): its names answer 503 with it instead of reaching whatever listens there.
+	Down string
 	// CertFile and KeyFile (from certs.SiteCert, covering Domain and *.Domain) are set when the site
 	// is secured. Deeper subdomains and aliases get certificates from Config.Issue.
 	CertFile string
 	KeyFile  string
 }
+
+// proxied reports whether the site is a proxied name (config.Proxy) rather than a PHP site.
+func (s Site) proxied() bool { return s.Root == "" && s.Proxy != "" }
 
 // Waiting is a linked site that can't be served because its PHP isn't installed: its names get
 // Flock's page saying so (and offering the install) instead of the "not linked" page.
@@ -142,16 +149,20 @@ func Caddyfile(cfg Config) string {
 			hosts := hosts(name)
 
 			if s.CertFile != "" {
-				fmt.Fprintf(&b, "\n%s {\n\timport flock_site\n%s%s}\n", addresses("https", hosts, cfg), tlsBlock, app(s))
+				fmt.Fprintf(&b, "\n%s {\n\timport flock_site\n%s%s%s}\n", addresses("https", hosts, cfg), tlsBlock, app(s), upstreamDown(s, cfg))
 				fmt.Fprintf(&b, "\n%s {\n\timport flock_site\n\tredir https://{host}%s{uri} 308\n}\n",
 					addresses("http", hosts, cfg), portSuffix(cfg.HTTPSPort, 443))
 				continue
 			}
 
-			fmt.Fprintf(&b, "\n%s {\n\timport flock_site\n%s}\n", addresses("http", hosts, cfg), app(s))
+			fmt.Fprintf(&b, "\n%s {\n\timport flock_site\n%s%s}\n", addresses("http", hosts, cfg), app(s), upstreamDown(s, cfg))
 			// Over HTTPS, a site that isn't secured names itself, so the page asks to secure it rather than link it.
-			fmt.Fprintf(&b, "\n%s {\n\timport flock_site\n%s\tvars flock_site %s\n%s}\n",
-				addresses("https", hosts, cfg), tlsBlock, quote(siteName(s.Domain, cfg.TLD)), unlinked(cfg))
+			// A proxy says so too: the apps can't secure one yet, so the page offers only the command.
+			vars := fmt.Sprintf("\tvars flock_site %s\n", quote(siteName(s.Domain, cfg.TLD)))
+			if s.proxied() {
+				vars = fmt.Sprintf("\tvars {\n\t\tflock_site %s\n\t\tflock_proxy \"1\"\n\t}\n", quote(siteName(s.Domain, cfg.TLD)))
+			}
+			fmt.Fprintf(&b, "\n%s {\n\timport flock_site\n%s%s%s}\n", addresses("https", hosts, cfg), tlsBlock, vars, unlinked(cfg))
 		}
 	}
 
@@ -225,13 +236,33 @@ func unlinked(cfg Config) string {
 		quote(pagesDir(cfg)))
 }
 
+// upstreamDown serves a proxied name's page when its server doesn't answer, e.g. a dev server that
+// isn't started yet: the 502 Caddy itself makes when it can't reach the upstream, never a response
+// of the upstream's own (reverse_proxy passes those through, whatever their status). PHP sites
+// served by FrankenPHP proxy too, but keep Caddy's plain 502.
+func upstreamDown(s Site, cfg Config) string {
+	if !s.proxied() {
+		return ""
+	}
+	return fmt.Sprintf("\thandle_errors 502 {\n\t\tvars {\n\t\t\tflock_down_site %s\n\t\t\tflock_down_upstream %s\n\t\t}\n"+
+		"\t\troot * %s\n\t\trewrite * /unlinked.html\n\t\theader Cache-Control no-store\n\t\theader X-Flock-Page upstream-down\n"+
+		"\t\ttemplates\n\t\tfile_server {\n\t\t\tstatus 502\n\t\t}\n\t}\n",
+		quote(siteName(s.Domain, cfg.TLD)), quote(strings.TrimPrefix(s.Proxy, "http://")), quote(pagesDir(cfg)))
+}
+
 // xdebugRequest matches requests that ask for Xdebug: the cookie the Xdebug browser extensions
 // set (and Xdebug itself, after ?XDEBUG_SESSION_START), or a trigger in the query string.
 const xdebugRequest = `{cookie.XDEBUG_SESSION} != "" || {cookie.XDEBUG_TRIGGER} != "" || ` +
 	`{query.XDEBUG_SESSION} != "" || {query.XDEBUG_SESSION_START} != "" || {query.XDEBUG_TRIGGER} != ""`
 
 func app(s Site) string {
-	root := fmt.Sprintf("\troot * %s\n", quote(s.Root))
+	if s.Down != "" {
+		return fmt.Sprintf("\theader Cache-Control no-store\n\trespond %s 503\n", quote(s.Down))
+	}
+	root := ""
+	if s.Root != "" {
+		root = fmt.Sprintf("\troot * %s\n", quote(s.Root))
+	}
 	serve := func(indent string) string { return php(s.FPM, indent) }
 	if s.Proxy != "" {
 		serve = func(indent string) string { return proxy(s.Proxy, indent) }
@@ -246,9 +277,14 @@ func app(s Site) string {
 		xdebugRequest, php(s.DebugFPM, "\t\t"), serve("\t\t"))
 }
 
-// proxy sends every request to a FrankenPHP process, which serves the static files too. The Host
-// header passes unchanged, so the app sees its own domain.
+// proxy sends every request to a FrankenPHP process, which serves the static files too, or to a
+// proxied name's server. The Host header passes unchanged, so the app sees its own domain, and
+// WebSocket upgrades (a dev server's hot reload) pass through.
 func proxy(upstream, indent string) string {
+	// Caddy sends an HTTPS upstream its own host:port as the Host header; keep the request's instead.
+	if strings.HasPrefix(upstream, "https://") {
+		return fmt.Sprintf("%sreverse_proxy %s {\n%s\theader_up Host {http.request.hostport}\n%s}\n", indent, quote(upstream), indent, indent)
+	}
 	return fmt.Sprintf("%sreverse_proxy %s\n", indent, quote(upstream))
 }
 

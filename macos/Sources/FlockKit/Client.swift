@@ -124,6 +124,46 @@ public actor FlockClient {
         try await decode(Status.self, "DELETE", "/v1/sites/\(escape(name))")
     }
 
+    /// Serves <name>.test from upstream (a port, host:port or URL), adding the proxy or changing its
+    /// upstream. A nil secured keeps the proxy's setting (HTTP for a new one).
+    public func proxy(name: String, upstream: String, secured: Bool? = nil) async throws -> Status {
+        struct Body: Encodable { var name: String; var upstream: String; var secured: Bool? }
+        return try await decode(Status.self, "POST", "/v1/proxies", body: try JSONEncoder().encode(Body(name: name, upstream: upstream, secured: secured)))
+    }
+
+    /// Serves a proxy over HTTPS (on) or plain HTTP.
+    public func secureProxy(_ name: String, _ on: Bool) async throws -> Status {
+        try await decode(Status.self, "PATCH", "/v1/proxies/\(escape(name))", body: try JSONEncoder().encode(["secured": on]))
+    }
+
+    /// Sets the command that starts a proxy's server, the folder it runs in and, for a server it
+    /// starts in the background, the command that stops it. An empty command removes them.
+    public func setProxyCommand(_ name: String, command: String, dir: String, stopCommand: String) async throws -> Status {
+        struct Body: Encodable { var command: String; var dir: String; var stop_command: String }
+        return try await decode(Status.self, "PATCH", "/v1/proxies/\(escape(name))",
+                                body: try JSONEncoder().encode(Body(command: command, dir: dir, stop_command: stopCommand)))
+    }
+
+    /// Runs a proxy's command.
+    public func startProxy(_ name: String) async throws -> Status {
+        try await decode(Status.self, "POST", "/v1/proxies/\(escape(name))/start", timeout: Self.siteRestartTimeout)
+    }
+
+    /// Stops a proxy's command, or runs its stop command.
+    public func stopProxy(_ name: String) async throws -> Status {
+        try await decode(Status.self, "POST", "/v1/proxies/\(escape(name))/stop", timeout: 130)
+    }
+
+    /// Empties a service log, e.g. a proxy's command output.
+    public func clearServiceLog(_ name: String) async throws {
+        _ = try await send("DELETE", "/v1/logs/services/\(escape(name))")
+    }
+
+    /// Stops serving a proxy.
+    public func removeProxy(_ name: String) async throws -> Status {
+        try await decode(Status.self, "DELETE", "/v1/proxies/\(escape(name))")
+    }
+
     /// Adds an extra domain: a subdomain ("tenant1", "a.b") or an alias ("my-app-2.test").
     public func addDomain(site: String, domain: String) async throws -> Status {
         try await decode(Status.self, "POST", "/v1/sites/\(escape(site))/domains", body: try JSONEncoder().encode(["domain": domain]))

@@ -47,6 +47,25 @@ public sealed class SitesService : IAsyncDisposable
     public Task<OperationOutcome> RestartAsync(string site, CancellationToken token = default) =>
         MutateAsync(Key(site), site, (_, cancellationToken) => client.RestartSiteAsync(site, cancellationToken), token);
 
+    /// <summary>Adds a proxy, or changes its upstream (a port, host:port or URL). Site and proxy names never clash, so they share the site keys.</summary>
+    public Task<OperationOutcome> ProxyAsync(string name, string upstream, CancellationToken token = default) =>
+        MutateAsync(Key(name), name, (_, cancellationToken) => client.ProxyAsync(name, upstream, cancellationToken: cancellationToken), token);
+
+    public Task<OperationOutcome> SecureProxyAsync(string name, bool secured, CancellationToken token = default) =>
+        MutateAsync(Key(name), name, (_, cancellationToken) => client.SecureProxyAsync(name, secured, cancellationToken), token);
+
+    public Task<OperationOutcome> SetProxyCommandAsync(string name, string command, string dir, string stopCommand, CancellationToken token = default) =>
+        MutateAsync(Key(name), name, (_, cancellationToken) => client.SetProxyCommandAsync(name, command, dir, stopCommand, cancellationToken), token);
+
+    public Task<OperationOutcome> StartProxyAsync(string name, CancellationToken token = default) =>
+        MutateAsync(Key(name), name, (_, cancellationToken) => client.StartProxyAsync(name, cancellationToken), token);
+
+    public Task<OperationOutcome> StopProxyAsync(string name, CancellationToken token = default) =>
+        MutateAsync(Key(name), name, (_, cancellationToken) => client.StopProxyAsync(name, cancellationToken), token);
+
+    public Task<OperationOutcome> RemoveProxyAsync(string name, CancellationToken token = default) =>
+        MutateAsync(Key(name), name, (_, cancellationToken) => client.RemoveProxyAsync(name, cancellationToken), token);
+
     public Task<OperationOutcome> AddDomainAsync(string site, string domain, CancellationToken token = default) =>
         MutateAsync(Key(site), site, (_, cancellationToken) => client.AddDomainAsync(site, domain, cancellationToken), token);
 

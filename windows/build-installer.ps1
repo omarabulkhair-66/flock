@@ -37,7 +37,7 @@ finally {
     Pop-Location
 }
 
-# Signed when build.yml set up signing (sign.ps1), like the tray app (build.ps1) and the installer.
+# Signed when ci-build.yml sets up signing (sign.ps1), like the tray app (build.ps1) and the installer.
 $sign = Join-Path $PSScriptRoot "sign.ps1"
 & $sign "$out\flock.exe" "$out\flock-helper.exe" "$out\flockd.exe"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

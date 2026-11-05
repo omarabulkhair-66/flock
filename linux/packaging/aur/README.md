@@ -12,11 +12,11 @@ user's setup when Flock is removed. The packages conflict, so installing one rep
 that's how Arch users switch channels (`flock channel` tells them), and pacman counts the files they
 share as upgraded, so the setup stays. Arch has no Flock package repository: AUR helpers update Flock
 (`flock update` says so). CI builds the package from each `.deb` and installs it on `archlinux:latest`
-(build.yml).
+(ci-build.yml).
 
 ## Publishing
 
-Releases publish themselves: after beta.yml and release.yml publish a release, their `aur` job
+Releases publish themselves: after release-beta.yml and release-stable.yml publish a release, their `aur` job
 (`.github/actions/aur`) runs `publish.sh` for the packages of the channels the release now leads, as
 the update feed (`releases.json`) has them. `publish.sh` fills in the package's name, the version and
 the `.debs`' checksums, writes `.SRCINFO` and pushes to `ssh://aur@aur.archlinux.org/<package>.git`.

@@ -1,6 +1,6 @@
 # Signs files with Artifact Signing, through SignTool and its plugin: SIGN_DLIB is the plugin
 # (Azure.CodeSigning.Dlib.dll) and SIGN_METADATA its metadata.json (endpoint, account, certificate
-# profile), as build.yml sets them up. Without them it does nothing, so local builds stay unsigned.
+# profile), as ci-build.yml sets them up. Without them it does nothing, so local builds stay unsigned.
 #
 #   .\windows\sign.ps1 <file>...
 #

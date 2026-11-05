@@ -6,7 +6,7 @@
 //	go run ./tools/release feed ...       # adds a release to releases.json and writes appcast.xml
 //	go run ./tools/release keygen         # a new update signing key pair (once)
 //
-// The workflows in .github/workflows (beta.yml, release.yml) run it.
+// The workflows in .github/workflows (release-beta.yml, release-stable.yml) run it.
 package main
 
 import (
